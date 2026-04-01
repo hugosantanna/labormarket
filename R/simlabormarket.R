@@ -3,8 +3,8 @@
 #' This function creates a simulated labor market with parameters that control
 #' the number of firm types, the fraction of females in the labor market,
 #' percentage of movers, etc. The simulated panel includes worker and firm
-#' fixed effects, match effects, and optionally Mincer-style human capital
-#' variables (age, education, experience).
+#' fixed effects together with optionally Mincer-style human capital variables
+#' (age, education, experience).
 #'
 #' @param nk Integer >= 2. Number of firm types or clusters.
 #' @param ratiog Numeric in (0, 1). Fraction of females in the labor market.
@@ -257,21 +257,26 @@ simlabormarket <- function(nk = 6, ratiog = 0.45, lambda = 0.05, nl = 10, nt = 4
     
   data[, fid := dspell[data, fid]]
 
-  # generating random effects
+  # generating fixed worker and firm effects
   #-------------------------------------------------------------------------------------------------
   
   # bargaining gap
   barg_gap = 0.9
 
-  # match matrix with bargaining gap across gender
-  match = array(0,c(nl,nk, ng))
-  match[,,1] = alpha_mean %*% t(psi_mean)
-  match[,,2] = match[,,1] * barg_gap # Bargaining power heterogeneity. 
+  # worker fixed effects are assigned once per individual and then carried
+  # across the full panel. A bargaining gap is introduced through the mean.
+  worker_effects = unique(data[, .(i, l, gender)])
+  worker_effects[, alpha_mean_i := alpha_mean[l]]
+  worker_effects[gender == 2, alpha_mean_i := alpha_mean_i * barg_gap]
+  worker_effects[, alpha := rnorm(.N, alpha_mean_i, sd = abs(alpha_sd[l]))]
 
-  # random effects (we modify here for match effects and firm effects -  time invariant for now)
-  # I draw from a normal distribution and allow match effects to also have different sds
-  data[, psi := rnorm(.N, psi_mean[k], sd = 0.5), by = .(k)]
-	data[, alpha  := rnorm(.N, match[l,k,gender], sd = abs(alpha_sd[l])), by = .(k,l,gender)]
+  # firm fixed effects are assigned once per firm identifier and inherited by
+  # all observations linked to that firm across periods.
+  firm_effects = unique(data[, .(fid, k)])
+  firm_effects[, psi := rnorm(.N, psi_mean[k], sd = 0.5)]
+
+  data[worker_effects[, .(i, alpha)], alpha := i.alpha, on = "i"]
+  data[firm_effects[, .(fid, psi)], psi := i.psi, on = "fid"]
 
   # as a final step, I shift the entire effects to have a positive minimum
   # For alpha

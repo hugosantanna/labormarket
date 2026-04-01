@@ -28,6 +28,17 @@ test_that("gender is binary (0/1)", {
   expect_true(all(lm_obj@panel$gender %in% c(0, 1)))
 })
 
+test_that("worker and firm effects are fixed across the panel", {
+  lm_obj <- simlabormarket(nk = 3, nl = 3, nt = 4, ni = 100, lambda = 0.3)
+  panel <- lm_obj@panel
+
+  worker_alpha_counts <- panel[, .(n_alpha = data.table::uniqueN(alpha)), by = i]
+  firm_psi_counts <- panel[, .(n_psi = data.table::uniqueN(psi)), by = fid]
+
+  expect_true(all(worker_alpha_counts$n_alpha == 1))
+  expect_true(all(firm_psi_counts$n_psi == 1))
+})
+
 test_that("input validation errors on bad params", {
   expect_error(simlabormarket(nk = 1), "nk must be an integer >= 2")
   expect_error(simlabormarket(nl = 0), "nl must be an integer >= 2")

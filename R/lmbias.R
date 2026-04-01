@@ -79,14 +79,15 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
   }
 
   vcov <- match.arg(vcov, c("HC0", "HC1"))
+  parallel <- match.arg(parallel)
 
   if (!is.numeric(R) || length(R) != 1 || R < 1) {
     stop("R must be a positive integer (number of bootstrap replications)")
   }
   R <- as.integer(R)
 
-  if (!is.character(xvarname) || length(xvarname) != 1 || !(xvarname %in% names(data))) {
-    stop("xvarname must be a column name present in the data")
+  if (!is.character(xvarname) || length(xvarname) != 1) {
+    stop("xvarname must be a single character string")
   }
 
   if (length(femodel$fixef_vars) < 2) {
@@ -110,6 +111,22 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
     }
   }
 
+  cluster_var <- NULL
+  if (!is.null(cluster)) {
+    if (length(cluster) == 1 && is.character(cluster)) {
+      if (!(cluster %in% names(data))) {
+        stop("cluster must be either a column name in data or a vector with one value per observation")
+      }
+      cluster_vec <- data[[cluster]]
+    } else if (length(cluster) == nrow(data)) {
+      cluster_vec <- cluster
+    } else {
+      stop("cluster must be either a column name in data or a vector with one value per observation")
+    }
+    cluster_var <- ".__lmbias_cluster__"
+    data[[cluster_var]] <- as.factor(cluster_vec)
+  }
+
   data[[fe1]] <- factor(data[[fe1]])
   data[[fe2]] <- factor(data[[fe2]])
 
@@ -120,8 +137,8 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
   # #obs
   nobs <- femodel$nobs
 
-  nfe1 <- length(femodel$fixef_sizes[[1]])
-  nfe2 <- length(femodel$fixef_sizes[[2]])
+  nfe1 <- as.integer(femodel$fixef_sizes[1])
+  nfe2 <- as.integer(femodel$fixef_sizes[2])
   ncovar <- length(femodel$coefficients)
   k  <- nfe1 + nfe2 + ncovar
 
@@ -151,7 +168,6 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
     )),
     data = data
   )
-  Xcovar <- sparse.model.matrix(~ get(xvarname) - 1, data = data)
 
   # what type of vcov
   if( vcov == "HC0") {
@@ -162,21 +178,20 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
 
   # Clustering method
   calculate_bias <- function(data = data, indices, phi, nobs, lhs, nfe1,
-                              nfe2, ncovar, X1, X2,
-                              Xcovar, cluster) {
+                              nfe2, ncovar, X1, X2, cluster_var) {
 
     # generating the random -1, 1 vetor (rademacher)
-    if(is.null(cluster)) {
+    if(is.null(cluster_var)) {
 
       r  <- sample(c(-1, 1), nobs, replace = TRUE)
       data$r <- r * phi
 
     } else {
 
-      groups <- unique(data[[cluster]])
+      groups <- unique(data[[cluster_var]])
       g <- length(groups)
       r  <- sample(c(-1, 1), g, replace = TRUE)
-      data$r <- r[match(data[[cluster]], groups)] * phi
+      data$r <- r[match(data[[cluster_var]], groups)] * phi
 
     }
 
@@ -218,8 +233,8 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
 
   # Starting the bootstrapping
   boot_mbias <- boot(data, statistic = calculate_bias, phi = phi,
-                      nobs = nobs, lhs = lhs, R = R, parallel = parallel, cluster = cluster,
-                      ncpus = ncpus, cl = cl, X1 = X1, X2 = X2, Xcovar = Xcovar)
+                      nobs = nobs, lhs = lhs, R = R, parallel = parallel,
+                      ncpus = ncpus, cl = cl, X1 = X1, X2 = X2, cluster_var = cluster_var)
 
   boot_res <- colMeans(boot_mbias$t)
   results <- cbind(

@@ -15,7 +15,6 @@ Imports:
     reshape2,
     lfe,
     fixest,
-    Matrix,
     boot
 Suggests:
     testthat (>= 3.0.0),

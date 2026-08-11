@@ -2,7 +2,6 @@
 
 export(lmbias)
 export(simlabormarket)
-import(Matrix)
 import(fixest)
 import(methods)
 importFrom(boot,boot)

@@ -18,7 +18,8 @@ lmbias(
 }
 \arguments{
 \item{femodel}{A model object of class \code{fixest} (from the \code{fixest} package) that contains the
-fixed effects estimates to be corrected. Must have at least two fixed effects.}
+fixed effects estimates to be corrected. The model must have exactly two additive
+fixed effects whose worker--firm graph is connected.}
 
 \item{data}{A data.frame or data.table object that contains the dataset used for the fixed effects model.}
 
@@ -27,14 +28,16 @@ used. Must be one of \code{"HC0"} or \code{"HC1"} (default).}
 
 \item{R}{An integer that sets the number of bootstrap replications. Default is 1000.}
 
-\item{xvarname}{A character string giving the name of the column in \code{data} that contains
-the linear predictor (X * beta). Default is \code{"xbeta"}.}
+\item{xvarname}{Deprecated and retained for backward compatibility. The wild bootstrap
+refits the original model specification and does not require a precomputed linear
+predictor.}
 
 \item{parallel}{A character string that determines the type of parallel operation to be used
 (if any). Possible values are \code{"no"}, \code{"multicore"}, and \code{"snow"}. Default is \code{"no"}.}
 
-\item{cluster}{An optional vector or factor that provides the data's cluster IDs if cluster
-bootstrapping is desired.}
+\item{cluster}{An optional character string naming a cluster-ID column in \code{data}, or a
+vector/factor with one cluster ID per row of \code{data}. One Rademacher draw is used per
+cluster in each replication.}
 
 \item{ncpus}{An integer specifying the number of CPUs to be used for parallel processing.
 This argument is relevant only if \code{parallel} is set to \code{"multicore"} or \code{"snow"}.
@@ -45,7 +48,8 @@ supplied and \code{parallel = "snow"}, a cluster on the local machine is created
 }
 \value{
 A 3x4 matrix with rows \code{"Original"}, \code{"Bias"}, and \code{"Corrected"}, and columns for
-variance of each fixed effect, covariance, and correlation.
+variance of each fixed effect, covariance, and correlation. The corrected
+correlation is \code{NA} if either corrected variance is nonpositive.
 }
 \description{
 The \code{lmbias} function applies a bootstrapping technique to correct the limited mobility bias
@@ -72,9 +76,8 @@ panel$fid <- droplevels(panel$fid)
 # Fit a two-way fixed effects model
 model <- fixest::feols(lw ~ 1 | i + fid, data = panel)
 
-# Add the linear predictor column (match model obs)
+# Match the model observations
 panel <- panel[!is.na(predict(model, newdata = panel)), ]
-panel$xbeta <- 0
 
 # Correct limited mobility bias (small R for demo)
 lmbias(model, panel, R = 50)

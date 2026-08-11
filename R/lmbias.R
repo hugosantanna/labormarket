@@ -6,17 +6,20 @@
 #' vector and the fixest package's model specifications for its calculations.
 #'
 #' @param femodel A model object of class `fixest` (from the `fixest` package) that contains the
-#'        fixed effects estimates to be corrected. Must have at least two fixed effects.
+#'        fixed effects estimates to be corrected. The model must have exactly two additive
+#'        fixed effects whose worker--firm graph is connected.
 #' @param data A data.frame or data.table object that contains the dataset used for the fixed effects model.
 #' @param vcov A character string specifying the type of heteroskedasticity correction to be
 #'        used. Must be one of `"HC0"` or `"HC1"` (default).
 #' @param R An integer that sets the number of bootstrap replications. Default is 1000.
-#' @param xvarname A character string giving the name of the column in `data` that contains
-#'        the linear predictor (X * beta). Default is `"xbeta"`.
+#' @param xvarname Deprecated and retained for backward compatibility. The wild bootstrap
+#'        refits the original model specification and does not require a precomputed linear
+#'        predictor.
 #' @param parallel A character string that determines the type of parallel operation to be used
 #'        (if any). Possible values are `"no"`, `"multicore"`, and `"snow"`. Default is `"no"`.
-#' @param cluster An optional vector or factor that provides the data's cluster IDs if cluster
-#'        bootstrapping is desired.
+#' @param cluster An optional character string naming a cluster-ID column in `data`, or a
+#'        vector/factor with one cluster ID per row of `data`. One Rademacher draw is used per
+#'        cluster in each replication.
 #' @param ncpus An integer specifying the number of CPUs to be used for parallel processing.
 #'        This argument is relevant only if `parallel` is set to `"multicore"` or `"snow"`.
 #'        Default uses the option set in `getOption("boot.ncpus", 1L)`.
@@ -24,7 +27,8 @@
 #'        supplied and `parallel = "snow"`, a cluster on the local machine is created.
 #'
 #' @return A 3x4 matrix with rows `"Original"`, `"Bias"`, and `"Corrected"`, and columns for
-#'         variance of each fixed effect, covariance, and correlation.
+#'         variance of each fixed effect, covariance, and correlation. The corrected
+#'         correlation is `NA` if either corrected variance is nonpositive.
 #'
 #' @references
 #' Azkarate-Askasua, M. and Zerecero, M. (2022). "The Macroeconomics of Firms' Financing."
@@ -32,7 +36,6 @@
 #'
 #' @seealso [simlabormarket()] for simulating labor market data suitable for this function.
 #'
-#' @import Matrix
 #' @importFrom boot boot
 #' @importFrom lfe compfactor
 #' @import fixest
@@ -57,9 +60,8 @@
 #' # Fit a two-way fixed effects model
 #' model <- fixest::feols(lw ~ 1 | i + fid, data = panel)
 #'
-#' # Add the linear predictor column (match model obs)
+#' # Match the model observations
 #' panel <- panel[!is.na(predict(model, newdata = panel)), ]
-#' panel$xbeta <- 0
 #'
 #' # Correct limited mobility bias (small R for demo)
 #' lmbias(model, panel, R = 50)
@@ -69,40 +71,76 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
                     parallel = c("no", "multicore", "snow"), cluster =  NULL,
                     ncpus = getOption("boot.ncpus", 1L), cl = NULL) {
 
-# Checking if the variables are correct
+  # Checking if the variables are correct
   if (!inherits(femodel, "fixest")) {
     stop("The model must be a fixest object (e.g., from feols())")
   }
 
-  if(!("data.frame" %in% class(data))) {
+  if (!is.data.frame(data)) {
     stop("The data must be a data.frame or data.table object")
   }
 
   vcov <- match.arg(vcov, c("HC0", "HC1"))
+  parallel <- match.arg(parallel)
 
-  if (!is.numeric(R) || length(R) != 1 || R < 1) {
+  if (!is.numeric(R) || length(R) != 1L || !is.finite(R) ||
+      R < 1 || R != floor(R)) {
     stop("R must be a positive integer (number of bootstrap replications)")
   }
   R <- as.integer(R)
 
-  if (!is.character(xvarname) || length(xvarname) != 1 || !(xvarname %in% names(data))) {
-    stop("xvarname must be a column name present in the data")
+  # Kept in the signature so existing calls continue to work. Earlier versions
+  # constructed a matrix from xvarname but never used it in the estimator.
+  if (!missing(xvarname) && (!is.character(xvarname) || length(xvarname) != 1L)) {
+    stop("xvarname must be a single character string")
   }
 
-  if (length(femodel$fixef_vars) < 2) {
-    stop("The model must have at least two fixed effects")
+  model_method <- if (!is.null(femodel$method_type)) {
+    femodel$method_type
+  } else {
+    femodel$method
+  }
+  if (!is.null(model_method) && !identical(model_method, "feols")) {
+    stop("The model must be estimated with fixest::feols()")
+  }
+
+  if (length(femodel$fixef_vars) != 2L) {
+    stop("The model must have exactly two fixed effects")
+  }
+
+  if (!is.null(femodel$slope_flag) && any(femodel$slope_flag != 0L)) {
+    stop("Varying-slope fixed effects are not supported")
   }
 
   # fixed effects names
   fe1 <- femodel$fixef_vars[1]
   fe2 <- femodel$fixef_vars[2]
 
-  # Subset data to observations used by the model (handles singleton removal)
+  # Resolve clusters before applying the model's observation selection so that
+  # a vector aligned with the original data is subset in the same way.
   nobs_model <- femodel$nobs
+  input_nobs <- nrow(data)
+  cluster_values <- NULL
+  if (!is.null(cluster)) {
+    if (is.character(cluster) && length(cluster) == 1L && cluster %in% names(data)) {
+      cluster_values <- data[[cluster]]
+    } else if ((is.atomic(cluster) || is.factor(cluster)) &&
+               length(cluster) %in% c(input_nobs, nobs_model)) {
+      cluster_values <- cluster
+    } else {
+      stop("cluster must be a column name in data or a vector with one value per observation")
+    }
+  }
+
+  # Subset data to observations used by the model (handles NA and singleton removal).
   if (nrow(data) != nobs_model) {
     obs_removed <- femodel$obs_selection$obsRemoved
     if (!is.null(obs_removed)) {
+      kept_rows <- seq_len(input_nobs)[obs_removed]
       data <- data[obs_removed, ]  # negative indices in fixest = rows to drop
+      if (!is.null(cluster_values) && length(cluster_values) == input_nobs) {
+        cluster_values <- cluster_values[kept_rows]
+      }
     }
     if (nrow(data) != nobs_model) {
       stop("Data row count (", nrow(data), ") does not match model nobs (", nobs_model, "). ",
@@ -110,127 +148,110 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
     }
   }
 
+  if (!is.null(cluster_values)) {
+    if (length(cluster_values) != nobs_model) {
+      stop("cluster must have one value per observation used by the model")
+    }
+    if (anyNA(cluster_values)) {
+      stop("cluster IDs cannot contain missing values")
+    }
+  }
+
   data[[fe1]] <- factor(data[[fe1]])
   data[[fe2]] <- factor(data[[fe2]])
 
-  # fixed effects (originals)
-  beta_fe1_original <- fixef(femodel)[[1]]
-  beta_fe2_original <- fixef(femodel)[[2]]
-
-  # #obs
-  nobs <- femodel$nobs
-
-  nfe1 <- length(femodel$fixef_sizes[[1]])
-  nfe2 <- length(femodel$fixef_sizes[[2]])
-  ncovar <- length(femodel$coefficients)
-  k  <- nfe1 + nfe2 + ncovar
-
-  # converting to factors
-  data[[fe1]] <- as.factor(data[[fe1]])
-  data[[fe2]] <- as.factor(data[[fe2]])
-
-  # checking the connected set
-  if(nlevels(compfactor(list(factor(data[[fe1]]), factor(data[[fe2]])))) != 1) {
+  # A connected two-way FE design has rank n_fe1 + n_fe2 - 1. The
+  # normalization removes one, rather than one per FE dimension.
+  if (nlevels(compfactor(list(data[[fe1]], data[[fe2]]))) != 1L) {
     stop("The fixed effects must be connected in a single graph. \n
          Please check the data and the model with lfe::compfactor.")
   }
 
-  # left hand side
-  lhs <- as.character(formula(femodel))[3]
+  original_fe <- fixef(femodel)
+  beta_fe1_original <- original_fe[[1]]
+  beta_fe2_original <- original_fe[[2]]
 
-    # bootstrap function
-  X1 <- sparse.model.matrix(
-    formula(paste0("~",
-      paste(femodel$fixef_vars[1]), "-1"
-    )),
-    data = data
-  )
-  X2 <- sparse.model.matrix(
-    formula(paste0("~",
-      paste(femodel$fixef_vars[2]), "-1"
-    )),
-    data = data
-  )
-  Xcovar <- sparse.model.matrix(~ get(xvarname) - 1, data = data)
+  nobs <- femodel$nobs
+  nfe1 <- length(beta_fe1_original)
+  nfe2 <- length(beta_fe2_original)
+  ncovar <- length(femodel$coefficients)
+  k <- nfe1 + nfe2 - 1L + ncovar
+
+  if (vcov == "HC1" && nobs <= k) {
+    stop("HC correction is undefined because the model has no residual degrees of freedom")
+  }
+
+  model_rhs <- as.character(formula(femodel))[3L]
 
   # what type of vcov
-  if( vcov == "HC0") {
-    phi <- sqrt(resid(femodel)^2)
-  } else if (vcov == "HC1") {
-    phi <- sqrt(resid(femodel)^2 * nobs / (nobs - k))
+  if (vcov == "HC0") {
+    phi <- abs(resid(femodel))
+  } else {
+    phi <- abs(resid(femodel)) * sqrt(nobs / (nobs - k))
   }
 
-  # Clustering method
-  calculate_bias <- function(data = data, indices, phi, nobs, lhs, nfe1,
-                              nfe2, ncovar, X1, X2,
-                              Xcovar, cluster) {
-
-    # generating the random -1, 1 vetor (rademacher)
-    if(is.null(cluster)) {
-
-      r  <- sample(c(-1, 1), nobs, replace = TRUE)
-      data$r <- r * phi
-
+  calculate_bias <- function(data, phi, nobs, model_rhs, cluster_values) {
+    # The wild bootstrap keeps the design fixed. Ordinary bootstrap indices
+    # were deliberately ignored in earlier versions; sim = "parametric" below
+    # now expresses that design directly and avoids generating unused indices.
+    if (is.null(cluster_values)) {
+      r <- sample(c(-1, 1), nobs, replace = TRUE)
     } else {
-
-      groups <- unique(data[[cluster]])
+      groups <- unique(cluster_values)
       g <- length(groups)
-      r  <- sample(c(-1, 1), g, replace = TRUE)
-      data$r <- r[match(data[[cluster]], groups)] * phi
-
+      group_r <- sample(c(-1, 1), g, replace = TRUE)
+      r <- group_r[match(cluster_values, groups)]
     }
 
-
-    new_fml <- formula(paste0("r ~ ", lhs))
-    model <- feols(new_fml, data = data)
+    data$.__lmbias_response__ <- r * phi
+    new_fml <- formula(paste0(".__lmbias_response__ ~ ", model_rhs))
+    model <- feols(new_fml, data = data, notes = FALSE)
     fe <- fixef(model)
-    beta_fe1 <- fe[[1]]
-    beta_fe2 <- fe[[2]]
 
+    fe1_by_observation <- fe[[1]][model$fixef_id[[1]]]
+    fe2_by_observation <- fe[[2]][model$fixef_id[[2]]]
 
-    # creating the function: beta * A * beta
-    # I will exploit the fact we only need a scalar in the end to bypass
-    #    the gigantic dense matrix in the middle
-
-    # Generating the vector of ones
-    ones <- rep(1, nobs)
-
-    # Moment 1 --------------------------------------------------------------
-    m1 <- t(beta_fe1) %*% crossprod(X1) %*% beta_fe1
-    m1 <- (1/(nobs - 1)) * (m1 - (1/nobs) * (t(beta_fe1) %*% t(X1) %*% ones %*% t(ones) %*% X1 %*% beta_fe1))
-
-
-    # Moment 2 --------------------------------------------------------------
-    m2 <- (t(beta_fe2) %*% crossprod(X2) %*% beta_fe2)
-    m2 <- (1/(nobs - 1)) * (m2 - (1/nobs) * (t(beta_fe2) %*% t(X2) %*% ones %*% t(ones) %*% X2 %*% beta_fe2))
-
-    # Moment 3 --------------------------------------------------------------
-    m3_1 <- t(beta_fe2) %*% crossprod(X2, X1) %*% beta_fe1
-    m3_1 <- (0.5/(nobs - 1)) * (m3_1 - (1/nobs) * (t(beta_fe2) %*% t(X2) %*% ones %*% t(ones) %*% X1 %*% beta_fe1))
-
-    m3_2 <- t(beta_fe1) %*% crossprod(X1, X2) %*% beta_fe2
-    m3_2 <- (0.5/(nobs - 1)) * (m3_2 - (1/nobs) * (t(beta_fe1) %*% t(X1) %*% ones %*% t(ones) %*% X2 %*% beta_fe2))
-
-    m3 <- m3_1 + m3_2
-
-    return(c(as.numeric(m1), as.numeric(m2), as.numeric(m3)))
+    c(
+      var(fe1_by_observation),
+      var(fe2_by_observation),
+      cov(fe1_by_observation, fe2_by_observation)
+    )
   }
 
-  # Starting the bootstrapping
+  # Parametric mode is used as a parallel replication engine: calculate_bias
+  # generates the Rademacher outcome while retaining the original design.
   boot_mbias <- boot(data, statistic = calculate_bias, phi = phi,
-                      nobs = nobs, lhs = lhs, R = R, parallel = parallel, cluster = cluster,
-                      ncpus = ncpus, cl = cl, X1 = X1, X2 = X2, Xcovar = Xcovar)
+                     nobs = nobs, model_rhs = model_rhs, R = R,
+                     sim = "parametric", parallel = parallel,
+                     cluster_values = cluster_values, ncpus = ncpus, cl = cl)
 
-  boot_res <- colMeans(boot_mbias$t)
-  results <- cbind(
+  boot_res <- unname(colMeans(boot_mbias$t))
+  original_moments <- c(
     var(beta_fe1_original[femodel$fixef_id[[1]]]),
     var(beta_fe2_original[femodel$fixef_id[[2]]]),
-    cov(beta_fe1_original[femodel$fixef_id[[1]]], beta_fe2_original[femodel$fixef_id[[2]]]),
-    cor(beta_fe1_original[femodel$fixef_id[[1]]], beta_fe2_original[femodel$fixef_id[[2]]])
+    cov(beta_fe1_original[femodel$fixef_id[[1]]],
+        beta_fe2_original[femodel$fixef_id[[2]]])
   )
+  corrected_moments <- original_moments - boot_res
 
-  results <- rbind(results, cbind(t(boot_res), (boot_res[3]/(sqrt(boot_res[1]) * sqrt(boot_res[2])))))
-  results <- rbind(results, results[1,] - results[2,])
+  correlation_from_moments <- function(moments) {
+    if (any(!is.finite(moments)) || moments[1] <= 0 || moments[2] <= 0) {
+      return(NA_real_)
+    }
+    moments[3] / sqrt(moments[1] * moments[2])
+  }
+
+  corrected_correlation <- correlation_from_moments(corrected_moments)
+  if (is.na(corrected_correlation) &&
+      (corrected_moments[1] <= 0 || corrected_moments[2] <= 0)) {
+    warning("Corrected correlation is undefined because a corrected variance is nonpositive")
+  }
+
+  results <- rbind(
+    Original = c(original_moments, correlation_from_moments(original_moments)),
+    Bias = c(boot_res, correlation_from_moments(boot_res)),
+    Corrected = c(corrected_moments, corrected_correlation)
+  )
 
   colnames(results) <- c(
     paste0("Var of ", fe1),
@@ -238,7 +259,5 @@ lmbias <- function(femodel, data, vcov = "HC1", R = 1000, xvarname = "xbeta",
     paste0("Covariance"),
     paste0("Correlation")
   )
-  rownames(results) <- c("Original", "Bias", "Corrected")
-
-  return(results)
+  results
 }
